@@ -8,6 +8,7 @@ use super::*;
     derive(TS),
     ts(export, export_to = "../src/messages/")
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum MutationResult {
     Unchanged,
     Updated {
@@ -91,6 +92,19 @@ pub struct MoveRevision {
 pub struct MoveSource {
     pub id: RevId,
     pub parent_ids: Vec<CommitId>,
+}
+
+#[derive(Deserialize, Debug)]
+#[cfg_attr(
+    feature = "ts-rs",
+    derive(TS),
+    ts(export, export_to = "../src/messages/")
+)]
+pub struct MoveHunk {
+    pub from_id: RevId,
+    pub to_id: CommitId,
+    pub path: TreePath,
+    pub hunk: ChangeHunk,
 }
 
 /// Updates a revision's description

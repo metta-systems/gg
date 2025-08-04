@@ -152,7 +152,7 @@ pub enum ChangeKind {
     Modified,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(
     feature = "ts-rs",
     derive(TS),
@@ -163,7 +163,7 @@ pub struct ChangeHunk {
     pub lines: MultilineString,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(
     feature = "ts-rs",
     derive(TS),
@@ -174,7 +174,7 @@ pub struct HunkLocation {
     pub to_file: FileRange,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[cfg_attr(
     feature = "ts-rs",
     derive(TS),
@@ -192,6 +192,7 @@ pub struct FileRange {
     derive(TS),
     ts(export, export_to = "../src/messages/")
 )]
+#[allow(clippy::large_enum_variant)]
 pub enum RevResult {
     NotFound {
         id: RevId,
