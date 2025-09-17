@@ -4,7 +4,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use jj_lib::backend::{FileId, MergedTreeId, TreeValue};
+use jj_lib::backend::{CopyId, FileId, MergedTreeId, TreeValue};
+use jj_lib::git::expand_fetch_refspecs;
 use jj_lib::merge::Merge;
 use jj_lib::merged_tree::{MergedTree, MergedTreeBuilder};
 use jj_lib::ref_name::{RefNameBuf, RemoteName, RemoteNameBuf, RemoteRefSymbol};
@@ -22,17 +23,17 @@ use jj_lib::{
     revset::{self, RevsetIteratorExt},
     rewrite::{self, RebaseOptions, RebasedCommit},
     settings::UserSettings,
-    str_util::StringPattern,
     store::Store,
+    str_util::StringPattern,
 };
 use pollster::block_on;
+use tokio::io::AsyncReadExt as _;
 
 use crate::messages::{
     AbandonRevisions, BackoutRevisions, CheckoutRevision, CopyChanges, CreateRef, CreateRevision,
-    CreateRevisionBetween,
-    DeleteRef, DescribeRevision, DuplicateRevisions, GitFetch, GitPush, InsertRevision,
-    MoveChanges, MoveHunk, MoveRef, MoveRevision, MoveSource, MutationResult, RenameBranch, StoreRef,
-    TrackBranch, TreePath, UndoOperation, UntrackBranch,
+    CreateRevisionBetween, DeleteRef, DescribeRevision, DuplicateRevisions, GitFetch, GitPush,
+    InsertRevision, MoveChanges, MoveHunk, MoveRef, MoveRevision, MoveSource, MutationResult,
+    RenameBranch, StoreRef, TrackBranch, TreePath, UndoOperation, UntrackBranch,
 };
 
 use super::Mutation;
@@ -97,10 +98,10 @@ impl Mutation for BackoutRevisions {
         let reverted = ws.resolve_multiple_changes(self.ids)?;
         let reverted_parents: Result<Vec<_>, BackendError> = reverted[0].parents().collect();
 
-        let old_base_tree = rewrite::merge_commit_trees(tx.repo(), &reverted_parents?)?;
+        let old_base_tree = block_on(rewrite::merge_commit_trees(tx.repo(), &reverted_parents?))?;
         let new_base_tree = working_copy.tree()?;
         let old_tree = reverted[0].tree()?;
-        let new_tree = new_base_tree.merge(&old_tree, &old_base_tree)?;
+        let new_tree = block_on(new_base_tree.merge(old_tree, old_base_tree))?;
 
         tx.repo_mut()
             .rewrite_commit(&working_copy)
@@ -157,7 +158,7 @@ impl Mutation for CreateRevision {
 
         let parent_ids: Result<_, _> = parents_revset.iter().collect();
         let parent_commits = ws.resolve_multiple(parents_revset)?;
-        let merged_tree = rewrite::merge_commit_trees(tx.repo(), &parent_commits)?;
+        let merged_tree = block_on(rewrite::merge_commit_trees(tx.repo(), &parent_commits))?;
 
         let new_commit = tx
             .repo_mut()
@@ -179,28 +180,35 @@ impl Mutation for CreateRevision {
     }
 }
 
-
 impl Mutation for CreateRevisionBetween {
     fn execute(self: Box<Self>, ws: &mut WorkspaceSession) -> Result<MutationResult> {
         eprintln!("CreateREvisionBetween execute()");
         let mut tx = ws.start_transaction()?;
 
-        let parent_id = ws.resolve_single_commit(&self.after_id).context("resolve after_id")?;
+        let parent_id = ws
+            .resolve_single_commit(&self.after_id)
+            .context("resolve after_id")?;
         let parent_ids = vec![parent_id.id().clone()];
         let parent_commits = vec![parent_id];
-        let merged_tree = rewrite::merge_commit_trees(tx.repo(), &parent_commits)?;
+        let merged_tree = block_on(rewrite::merge_commit_trees(tx.repo(), &parent_commits))?;
 
         let new_commit = tx
             .repo_mut()
             .new_commit(parent_ids, merged_tree.id())
             .write()?;
 
-        let before_commit = ws.resolve_single_change(&self.before_id).context("resolve before_id")?;
+        let before_commit = ws
+            .resolve_single_change(&self.before_id)
+            .context("resolve before_id")?;
         if ws.check_immutable(vec![before_commit.id().clone()])? {
             precondition!("'Before' revision is immutable");
         }
 
-        rewrite::rebase_commit(tx.repo_mut(), before_commit, vec![new_commit.id().clone()])?;
+        block_on(rewrite::rebase_commit(
+            tx.repo_mut(),
+            before_commit,
+            vec![new_commit.id().clone()],
+        ))?;
 
         tx.repo_mut().edit(ws.name().to_owned(), &new_commit)?;
 
@@ -331,8 +339,16 @@ impl Mutation for InsertRevision {
 
         // rebase the target (which now has no children), then the new post-target tree atop it
         let rebased_id = target.id().hex();
-        let target = rewrite::rebase_commit(tx.repo_mut(), target, vec![after_id])?;
-        rewrite::rebase_commit(tx.repo_mut(), before, vec![target.id().clone()])?;
+        let target = block_on(rewrite::rebase_commit(
+            tx.repo_mut(),
+            target,
+            vec![after_id],
+        ))?;
+        block_on(rewrite::rebase_commit(
+            tx.repo_mut(),
+            before,
+            vec![target.id().clone()],
+        ))?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -368,7 +384,7 @@ impl Mutation for MoveRevision {
 
         // rebase the target itself
         let rebased_id = target.id().hex();
-        rewrite::rebase_commit(tx.repo_mut(), target, parent_ids)?;
+        block_on(rewrite::rebase_commit(tx.repo_mut(), target, parent_ids))?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -394,7 +410,7 @@ impl Mutation for MoveSource {
 
         // just rebase the target, which will also rebase its descendants
         let rebased_id = target.id().hex();
-        rewrite::rebase_commit(tx.repo_mut(), target, parent_ids)?;
+        block_on(rewrite::rebase_commit(tx.repo_mut(), target, parent_ids))?;
 
         match ws.finish_transaction(tx, format!("rebase commit {}", rebased_id))? {
             Some(new_status) => Ok(MutationResult::Updated { new_status }),
@@ -418,10 +434,18 @@ impl Mutation for MoveChanges {
         // construct a split tree and a remainder tree by copying changes from child to parent and from parent to child
         let from_tree = from.tree()?;
         let from_parents: Result<Vec<_>, _> = from.parents().collect();
-        let parent_tree = rewrite::merge_commit_trees(tx.repo(), &from_parents?)?;
-        let split_tree_id = rewrite::restore_tree(&from_tree, &parent_tree, matcher.as_ref())?;
+        let parent_tree = block_on(rewrite::merge_commit_trees(tx.repo(), &from_parents?))?;
+        let split_tree_id = block_on(rewrite::restore_tree(
+            &from_tree,
+            &parent_tree,
+            matcher.as_ref(),
+        ))?;
         let split_tree = tx.repo().store().get_root_tree(&split_tree_id)?;
-        let remainder_tree_id = rewrite::restore_tree(&parent_tree, &from_tree, matcher.as_ref())?;
+        let remainder_tree_id = block_on(rewrite::restore_tree(
+            &parent_tree,
+            &from_tree,
+            matcher.as_ref(),
+        ))?;
         let remainder_tree = tx.repo().store().get_root_tree(&remainder_tree_id)?;
 
         // abandon or rewrite source
@@ -459,7 +483,7 @@ impl Mutation for MoveChanges {
 
         // apply changes to destination
         let to_tree = to.tree()?;
-        let new_to_tree = to_tree.merge(&parent_tree, &split_tree)?;
+        let new_to_tree = block_on(to_tree.merge(parent_tree, split_tree))?;
         let description = combine_messages(&from, &to, abandon_source);
         tx.repo_mut()
             .rewrite_commit(&to)
@@ -491,7 +515,11 @@ impl Mutation for CopyChanges {
 
         // construct a restore tree - the destination with some portions overwritten by the source
         let to_tree = to.tree()?;
-        let new_to_tree_id = rewrite::restore_tree(&from_tree, &to_tree, matcher.as_ref())?;
+        let new_to_tree_id = block_on(rewrite::restore_tree(
+            &from_tree,
+            &to_tree,
+            matcher.as_ref(),
+        ))?;
         if &new_to_tree_id == to.tree_id() {
             Ok(MutationResult::Unchanged)
         } else {
@@ -870,7 +898,8 @@ impl Mutation for MoveHunk {
         let target_commit = ws.resolve_single_commit(&self.to_id)?;
 
         // Get parent commit - error if merge commit for now
-        let from_parents: Result<Vec<Commit>, jj_lib::backend::BackendError> = from_commit.parents().collect();
+        let from_parents: Result<Vec<Commit>, jj_lib::backend::BackendError> =
+            from_commit.parents().collect();
         let from_parents = from_parents?; // Handle potential error
         if from_parents.len() != 1 {
             precondition!("Cannot move hunk from a merge commit yet");
@@ -886,11 +915,10 @@ impl Mutation for MoveHunk {
         let parent_tree = parent_commit.tree()?;
 
         // --- Check relationship ---
-        let is_descendant= ws
+        let is_descendant = ws
             .repo()
             .index()
             .is_ancestor(from_commit.id(), target_commit.id());
-
 
         // --- Calculate intermediate trees ---
 
@@ -901,7 +929,13 @@ impl Mutation for MoveHunk {
         // Resolve potential conflicts in source tree path to determine executable status
         let hunk_executable = match from_tree.path_value(&repo_path)?.into_resolved() {
             Ok(Some(tree_value)) => {
-                matches!(tree_value, TreeValue::File { executable: true, .. })
+                matches!(
+                    tree_value,
+                    TreeValue::File {
+                        executable: true,
+                        ..
+                    }
+                )
             }
             Ok(None) => false, // Not present or resolved to nothing
             Err(conflict) => {
@@ -914,13 +948,19 @@ impl Mutation for MoveHunk {
                 ));
             }
         };
-        let hunk_tree_id = update_tree_entry(store, &parent_tree, &repo_path, hunk_blob_id, hunk_executable)?;
+        let hunk_tree_id = update_tree_entry(
+            store,
+            &parent_tree,
+            &repo_path,
+            hunk_blob_id,
+            hunk_executable,
+        )?;
         let hunk_tree = ws.repo().store().get_root_tree(&hunk_tree_id)?;
 
         // 2. Calculate `remainder_tree`: from_tree with hunk reverted.
         //    remainder = from_tree - (hunk_tree - parent_tree)
         //    This is equivalent to the 3-way merge: from_tree.merge(&hunk_tree, &parent_tree)
-        let remainder_tree = from_tree.merge(&hunk_tree, &parent_tree)?;
+        let remainder_tree = block_on(from_tree.merge(hunk_tree.clone(), parent_tree.clone()))?;
         let remainder_tree_id = remainder_tree.id();
 
         // --- Merge and Rewrite ---
@@ -934,7 +974,9 @@ impl Mutation for MoveHunk {
         if abandon_source {
             if is_descendant {
                 // To simplify parent mapping for B later, disallow this for now.
-                 precondition!("Moving a hunk from a commit that becomes empty to a descendant is not yet supported.");
+                precondition!(
+                    "Moving a hunk from a commit that becomes empty to a descendant is not yet supported."
+                );
             }
             tx.repo_mut().record_abandoned_commit(&from_commit);
         } else {
@@ -954,8 +996,9 @@ impl Mutation for MoveHunk {
                 precondition!("Moving a hunk to a descendant merge commit is not yet supported.");
             }
 
-            let a_prime_id = rewritten_source_id
-                .ok_or_else(|| anyhow!("Source commit was abandoned, cannot reparent descendant"))?;
+            let a_prime_id = rewritten_source_id.ok_or_else(|| {
+                anyhow!("Source commit was abandoned, cannot reparent descendant")
+            })?;
 
             // Assuming A was the only parent for simplicity (enforced by check above)
             let new_parent_ids = vec![a_prime_id];
@@ -968,11 +1011,13 @@ impl Mutation for MoveHunk {
                 .write()?;
         } else {
             // Target is not descendant: Merge hunk change into target tree
-            let new_target_tree = target_tree.merge(&parent_tree, &hunk_tree)?;
+            let target_tree_id = target_tree.id();
+            let new_target_tree =
+                block_on(target_tree.merge(parent_tree.clone(), hunk_tree.clone()))?;
             let new_target_tree_id = new_target_tree.id();
 
             // Rewrite target commit only if its tree changed
-            if new_target_tree_id != target_tree.id() {
+            if new_target_tree_id != target_tree_id {
                 tx.repo_mut()
                     .rewrite_commit(&target_commit)
                     .set_tree_id(new_target_tree_id.clone())
@@ -1004,13 +1049,13 @@ impl Mutation for MoveHunk {
 fn read_file_content(store: &Arc<Store>, tree: &MergedTree, path: &RepoPath) -> Result<Vec<u8>> {
     match tree.path_value(path)?.into_resolved() {
         Ok(Some(TreeValue::File { id, .. })) => {
-            let mut reader = store.read_file(path, &id)?;
+            let mut reader = block_on(store.read_file(path, &id))?;
             let mut content = Vec::new();
-            reader.read_to_end(&mut content)?;
+            block_on(reader.read_to_end(&mut content))?;
             Ok(content)
         }
         Ok(Some(_)) => Ok(Vec::new()), // Found, but not a file (Tree, Symlink, Conflict, GitSubmodule)
-        Ok(None) => Ok(Vec::new()), // Not found
+        Ok(None) => Ok(Vec::new()),    // Not found
         Err(conflict) => {
             // Handle conflict when reading file content
             Err(anyhow!(
@@ -1038,7 +1083,11 @@ fn apply_hunk(content: &[u8], hunk: &crate::messages::ChangeHunk) -> Result<Vec<
     // 1. Add lines from base content before the hunk starts.
     //    hunk.location.from_file.start is 1-based index of the *first context/removed line*.
     let hunk_start_line_0_based = hunk.location.from_file.start.saturating_sub(1);
-    result_lines.extend(base_lines[..hunk_start_line_0_based].iter().map(|s| s.to_string()));
+    result_lines.extend(
+        base_lines[..hunk_start_line_0_based]
+            .iter()
+            .map(|s| s.to_string()),
+    );
     base_line_idx = hunk_start_line_0_based;
 
     // 2. Process the hunk lines.
@@ -1047,7 +1096,9 @@ fn apply_hunk(content: &[u8], hunk: &crate::messages::ChangeHunk) -> Result<Vec<
             // Context line (' ') or removed line ('-'): consume from base.
             // Check if base content matches context/removed line, ignoring trailing whitespace.
             let hunk_content_part = &hunk_line[1..];
-            if base_line_idx < base_lines.len() && base_lines[base_line_idx].trim_end() == hunk_content_part.trim_end() {
+            if base_line_idx < base_lines.len()
+                && base_lines[base_line_idx].trim_end() == hunk_content_part.trim_end()
+            {
                 // Only add context lines to the result
                 if hunk_line.starts_with(' ') {
                     // Add the original base line, preserving its exact whitespace
@@ -1060,7 +1111,9 @@ fn apply_hunk(content: &[u8], hunk: &crate::messages::ChangeHunk) -> Result<Vec<
                     "Hunk mismatch: context/removed line does not match base content at index {}. Expected (trimmed): '{}', Found (trimmed): '{}'",
                     base_line_idx,
                     hunk_content_part.trim_end(), // Show trimmed in error for clarity
-                    base_lines.get(base_line_idx).map_or("<EOF>", |l| l.trim_end())
+                    base_lines
+                        .get(base_line_idx)
+                        .map_or("<EOF>", |l| l.trim_end())
                 ));
             }
         } else if hunk_line.starts_with('+') {
@@ -1069,7 +1122,7 @@ fn apply_hunk(content: &[u8], hunk: &crate::messages::ChangeHunk) -> Result<Vec<
             result_lines.push(added_content.to_string());
         } else {
             // Malformed hunk line
-             return Err(anyhow!("Malformed hunk line: {}", hunk_line));
+            return Err(anyhow!("Malformed hunk line: {}", hunk_line));
         }
     }
 
@@ -1092,7 +1145,7 @@ fn apply_hunk(content: &[u8], hunk: &crate::messages::ChangeHunk) -> Result<Vec<
         // Ensure we don't add a *double* newline if the last line already ended with one
         // (unlikely with lines() iterator, but safer to check)
         if !result_bytes.ends_with(b"\n") {
-             result_bytes.push(b'\n');
+            result_bytes.push(b'\n');
         }
     }
 
@@ -1113,6 +1166,7 @@ fn update_tree_entry(
         Merge::normal(TreeValue::File {
             id: new_blob,
             executable,
+            copy_id: CopyId::placeholder(),
         }),
     );
     let new_tree_id = builder.write_tree(store)?;
@@ -1359,17 +1413,19 @@ impl Mutation for GitFetch {
 
         for (remote_name, pattern) in remote_patterns {
             ws.session.callbacks.with_git(tx.repo_mut(), &|repo, cb| {
-                let mut fetcher = git::GitFetch::new(repo, &git_settings)?;
-                fetcher
-                    .fetch(
-                        RemoteName::new(&remote_name),
-                        &[pattern
+                let remote_name = RemoteName::new(&remote_name);
+                let refspecs = expand_fetch_refspecs(
+                    &remote_name,
+                    vec![
+                        pattern
                             .clone()
                             .map(StringPattern::exact)
-                            .unwrap_or_else(StringPattern::everything)],
-                        cb,
-                        None,
-                    )
+                            .unwrap_or_else(StringPattern::everything),
+                    ],
+                )?;
+                let mut fetcher = git::GitFetch::new(repo, &git_settings)?;
+                fetcher
+                    .fetch(&remote_name, refspecs, cb, None, None)
                     .context("failed to fetch")?;
                 Ok(())
             })?;

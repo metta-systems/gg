@@ -14,12 +14,12 @@ use itertools::Itertools;
 use jj_cli::diff_util::{LineCompareMode, LineDiffOptions};
 use jj_lib::{
     backend::CommitId,
-    conflicts::{self, ConflictMarkerStyle, MaterializedFileValue, MaterializedTreeValue},
+    conflicts::{self, ConflictMaterializeOptions, MaterializedFileValue, MaterializedTreeValue},
     diff::{
         CompareBytesExactly, CompareBytesIgnoreAllWhitespace, CompareBytesIgnoreWhitespaceAmount,
         Diff, DiffHunk, DiffHunkKind, find_line_ranges,
     },
-    graph::{GraphEdge, GraphEdgeType, TopoGroupedGraphIterator},
+    graph::{GraphEdgeType, GraphNode, TopoGroupedGraphIterator},
     matchers::EverythingMatcher,
     merged_tree::{TreeDiffEntry, TreeDiffStream},
     ref_name::{RefNameBuf, RemoteNameBuf, RemoteRefSymbol},
@@ -29,6 +29,8 @@ use jj_lib::{
     rewrite,
 };
 use pollster::FutureExt;
+use pollster::block_on;
+use tokio::io::AsyncReadExt as _;
 
 use crate::messages::{
     ChangeHunk, ChangeKind, FileRange, HunkLocation, LogCoordinates, LogLine, LogPage, LogRow,
@@ -74,14 +76,9 @@ pub struct QuerySession<'q, 'w: 'q> {
         Skip<
             TopoGroupedGraphIterator<
                 CommitId,
-                Box<
-                    dyn Iterator<
-                            Item = Result<
-                                (CommitId, Vec<GraphEdge<CommitId>>),
-                                RevsetEvaluationError,
-                            >,
-                        > + 'q,
-                >,
+                CommitId,
+                Box<dyn Iterator<Item = Result<GraphNode<CommitId>, RevsetEvaluationError>> + 'q>,
+                for<'a> fn(&'a CommitId) -> &'a CommitId,
             >,
         >,
     >,
@@ -95,9 +92,16 @@ impl<'q, 'w> QuerySession<'q, 'w> {
         revset: &'q dyn Revset,
         state: QueryState,
     ) -> QuerySession<'q, 'w> {
-        let iter = TopoGroupedGraphIterator::new(revset.iter_graph())
-            .skip(state.next_row)
-            .peekable();
+        fn identity(id: &CommitId) -> &CommitId {
+            id
+        }
+
+        let iter = TopoGroupedGraphIterator::new(
+            revset.iter_graph(),
+            identity as for<'a> fn(&'a CommitId) -> &'a CommitId,
+        )
+        .skip(state.next_row)
+        .peekable();
 
         let immutable_revset = ws.evaluate_immutable().unwrap();
         let is_immutable = immutable_revset.containing_fn();
@@ -297,7 +301,7 @@ pub fn query_revision(ws: &WorkspaceSession, id: RevId) -> Result<RevResult> {
     };
 
     let commit_parents: Result<Vec<_>, _> = commit.parents().collect();
-    let parent_tree = rewrite::merge_commit_trees(ws.repo(), &commit_parents?)?;
+    let parent_tree = block_on(rewrite::merge_commit_trees(ws.repo(), &commit_parents?))?;
     let tree = commit.tree()?;
 
     let mut conflicts = Vec::new();
@@ -311,8 +315,8 @@ pub fn query_revision(ws: &WorkspaceSession, id: RevId) -> Result<RevResult> {
                         let mut hunk_content = vec![];
                         conflicts::materialize_merge_result(
                             &file.contents,
-                            ConflictMarkerStyle::default(),
                             &mut hunk_content,
+                            &ConflictMaterializeOptions::default(),
                         )?;
                         let mut hunks = get_unified_hunks(3, &hunk_content, &[])?;
                         if let Some(hunk) = hunks.pop() {
@@ -457,7 +461,7 @@ fn get_value_contents(path: &RepoPath, value: MaterializedTreeValue) -> Result<V
         )),
         MaterializedTreeValue::File(MaterializedFileValue { mut reader, .. }) => {
             let mut contents = vec![];
-            reader.read_to_end(&mut contents)?;
+            block_on(reader.read_to_end(&mut contents))?;
 
             let start = &contents[..8000.min(contents.len())]; // same heuristic git uses
             let is_binary = start.contains(&b'\0');
@@ -473,8 +477,8 @@ fn get_value_contents(path: &RepoPath, value: MaterializedTreeValue) -> Result<V
             let mut hunk_content = vec![];
             conflicts::materialize_merge_result(
                 &file.contents,
-                ConflictMarkerStyle::default(),
                 &mut hunk_content,
+                &ConflictMaterializeOptions::default(),
             )?;
             Ok(hunk_content)
         }
