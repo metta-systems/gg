@@ -34,7 +34,7 @@ icon = [
     "icons/icon.ico",
 ]
 
-[bundle.windows]
-signCommand = "trusted-signing-cli -e https://wus2.codesigning.azure.net/ -a agile-signing -c cloud-apps %1"
+# [bundle.windows]
+# signCommand = "trusted-signing-cli -e https://wus2.codesigning.azure.net/ -a agile-signing -c cloud-apps %1"
 
 [plugins]
