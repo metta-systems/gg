@@ -1,4 +1,10 @@
 # GG Changelog
+## [0.40.0](releases/tag/v0.40.0)
+This version is based on Jujutsu 0.35.
+
+### Changed
+- Support rendering git emojis in the history tree
+- Swap squash and restore icons (squash pushes changes down)
 
 ## [0.35.1](releases/tag/v0.35.0)
 
